@@ -421,6 +421,65 @@ jobs:
           set -euo pipefail
           cd "$PROJECT_DIR"
           npx cap sync android
+      - name: Apply Snake 26S launcher icon
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ICON_FILE="${GITHUB_WORKSPACE}/snake26s-icon.png"
+          RES_DIR="${PROJECT_DIR}/android/app/src/main/res"
+
+          if [[ ! -f "$ICON_FILE" ]]; then
+            echo "ERROR: snake26s-icon.png was not found in the repository root."
+            echo "Upload the provided icon PNG to the root of the Snake2026s repository."
+            exit 1
+          fi
+          if [[ ! -d "$RES_DIR" ]]; then
+            echo "ERROR: Android resource folder was not found: $RES_DIR"
+            exit 1
+          fi
+
+          python3 -m venv "$RUNNER_TEMP/icon-tools"
+          "$RUNNER_TEMP/icon-tools/bin/pip" install --quiet Pillow
+          "$RUNNER_TEMP/icon-tools/bin/python" - "$ICON_FILE" "$RES_DIR" <<'PYICON'
+          from pathlib import Path
+          from PIL import Image
+          import sys
+
+          icon_path = Path(sys.argv[1])
+          res_dir = Path(sys.argv[2])
+          image = Image.open(icon_path).convert("RGBA")
+          side = min(image.size)
+          left = (image.width - side) // 2
+          top = (image.height - side) // 2
+          image = image.crop((left, top, left + side, top + side))
+
+          sizes = {
+              "mipmap-mdpi": 48,
+              "mipmap-hdpi": 72,
+              "mipmap-xhdpi": 96,
+              "mipmap-xxhdpi": 144,
+              "mipmap-xxxhdpi": 192,
+          }
+
+          for folder, pixels in sizes.items():
+              target_dir = res_dir / folder
+              target_dir.mkdir(parents=True, exist_ok=True)
+              resized = image.resize((pixels, pixels), Image.Resampling.LANCZOS)
+              for filename in ("ic_launcher.png", "ic_launcher_round.png"):
+                  resized.save(target_dir / filename, format="PNG", optimize=True)
+
+          # Remove Android 8+ adaptive XML definitions so Android uses the
+          # custom PNGs above instead of the template's default launcher art.
+          adaptive_dir = res_dir / "mipmap-anydpi-v26"
+          for filename in ("ic_launcher.xml", "ic_launcher_round.xml"):
+              xml_file = adaptive_dir / filename
+              if xml_file.exists():
+                  xml_file.unlink()
+
+          print("Snake 26S custom launcher icons installed for all standard densities.")
+          PYICON
+
 
       - name: Build debug APK
         shell: bash
