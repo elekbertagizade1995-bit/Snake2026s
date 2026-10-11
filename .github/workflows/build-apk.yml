@@ -14,8 +14,10 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repository with history
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v5
@@ -43,8 +45,6 @@ jobs:
           fi
 
           if [[ -z "$SDKMANAGER" || ! -x "$SDKMANAGER" ]]; then
-            echo "Downloading official Android command-line tools..."
-
             TOOLS_ZIP="$RUNNER_TEMP/commandlinetools-linux.zip"
             TOOLS_DIR="$RUNNER_TEMP/android-commandlinetools"
 
@@ -54,17 +54,15 @@ jobs:
 
             rm -rf "$TOOLS_DIR"
             mkdir -p "$TOOLS_DIR" "$SDK_ROOT/cmdline-tools"
-
             unzip -q "$TOOLS_ZIP" -d "$TOOLS_DIR"
 
             rm -rf "$SDK_ROOT/cmdline-tools/latest"
             mv "$TOOLS_DIR/cmdline-tools" "$SDK_ROOT/cmdline-tools/latest"
-
             SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
           fi
 
           if [[ ! -x "$SDKMANAGER" ]]; then
-            echo "ERROR: sdkmanager could not be located."
+            echo "ERROR: Android SDK command-line tools were not found."
             exit 1
           fi
 
@@ -80,26 +78,91 @@ jobs:
             "platforms;android-34" \
             "build-tools;34.0.0"
 
-      - name: Rebuild source ZIP
+      - name: Locate or recover source archive
         shell: bash
         run: |
           set -euo pipefail
 
-          if compgen -G 'snake26s.part-*' > /dev/null; then
-            echo "Reassembling source ZIP..."
-            cat snake26s.part-* > snake26s.zip
-          elif [[ -f snake26s.zip ]]; then
-            echo "Using existing source ZIP."
+          RECOVER_DIR="$RUNNER_TEMP/recovered-source-parts"
+          mkdir -p "$RECOVER_DIR" snake-project
+
+          mapfile -t PARTS < <(
+            find . -type f -name 'snake26s.part-*' -not -path './.git/*' \
+              -printf '%f\t%p\n' | sort -k1,1 | cut -f2-
+          )
+
+          if [[ ${#PARTS[@]} -eq 0 ]]; then
+            echo "Split parts not found in current checkout. Checking Git history..."
+
+            mapfile -t HISTORIC_PATHS < <(
+              git log --all --format= --name-only \
+                | grep -E '(^|/)snake26s\.part-[^/]+$' \
+                | sort -u || true
+            )
+
+            for path in "${HISTORIC_PATHS[@]}"; do
+              part_name="$(basename "$path")"
+
+              while IFS= read -r commit; do
+                if git cat-file -e "$commit:$path" 2>/dev/null; then
+                  git show "$commit:$path" > "$RECOVER_DIR/$part_name"
+                  echo "Recovered $part_name from Git history."
+                  break
+                fi
+              done < <(git log --all --format='%H' -- "$path")
+            done
+
+            mapfile -t PARTS < <(
+              find "$RECOVER_DIR" -type f -name 'snake26s.part-*' \
+                -printf '%f\t%p\n' | sort -k1,1 | cut -f2-
+            )
+          fi
+
+          if [[ ${#PARTS[@]} -gt 0 ]]; then
+            echo "Combining ${#PARTS[@]} source part(s)..."
+            cat "${PARTS[@]}" > "$RUNNER_TEMP/snake26s.zip"
+            SOURCE_ZIP="$RUNNER_TEMP/snake26s.zip"
           else
-            echo "ERROR: Source ZIP files were not found."
+            echo "No split parts found. Searching for a complete ZIP..."
+            SOURCE_ZIP=""
+
+            for candidate in \
+              "./snake26s.zip" \
+              "./project-files.zip" \
+              "./Snake26S-Android-GitHub.zip" \
+              "./Snake26S-Android-Ready.zip" \
+              "./Snake26S-Android-Ready-v2.zip"; do
+              if [[ -f "$candidate" ]]; then
+                SOURCE_ZIP="$candidate"
+                break
+              fi
+            done
+
+            if [[ -z "$SOURCE_ZIP" ]]; then
+              SOURCE_ZIP="$(find . -type f \
+                \( -iname 'snake26s.zip' -o -iname 'project-files.zip' \
+                   -o -iname 'Snake26S-Android-GitHub.zip' \
+                   -o -iname 'Snake26S-Android-Ready.zip' \
+                   -o -iname 'Snake26S-Android-Ready-v2.zip' \) \
+                -not -path './.git/*' -print -quit)"
+            fi
+          fi
+
+          if [[ -z "$SOURCE_ZIP" || ! -f "$SOURCE_ZIP" ]]; then
+            echo "ERROR: No source archive found in the checkout or Git history."
+            echo "Repository files related to source:"
+            git ls-tree -r --name-only HEAD | grep -Ei 'snake26s\.part-|\.zip$|App\.tsx' || true
+            echo "Files in the latest commit:"
+            git ls-tree -r --name-only HEAD | head -100
             exit 1
           fi
 
-          unzip -tq snake26s.zip
-          mkdir -p snake-project
-          unzip -oq snake26s.zip -d snake-project
+          echo "Validating archive..."
+          unzip -tq "$SOURCE_ZIP"
+          unzip -oq "$SOURCE_ZIP" -d snake-project
+          echo "Archive extracted successfully."
 
-      - name: Find project directory
+      - name: Find game project directory
         shell: bash
         run: |
           set -euo pipefail
@@ -107,16 +170,16 @@ jobs:
           APP_FILE="$(find snake-project -type f -name App.tsx -print -quit)"
 
           if [[ -z "$APP_FILE" ]]; then
-            echo "ERROR: App.tsx was not found."
+            echo "ERROR: App.tsx was not found after extraction."
             find snake-project -maxdepth 4 -type f -print | head -80 || true
             exit 1
           fi
 
           PROJECT_DIR="$(dirname "$APP_FILE")"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Found project: $PROJECT_DIR"
+          echo "Found game project: $PROJECT_DIR"
 
-      - name: Prepare web and Android configuration
+      - name: Prepare Vite and Capacitor configuration
         shell: bash
         run: |
           set -euo pipefail
@@ -267,7 +330,7 @@ jobs:
           export default config;
           CAPACITOR_CONFIG
 
-      - name: Replace Playground SDK
+      - name: Replace Playground SDK with local adapter
         shell: bash
         run: |
           set -euo pipefail
@@ -279,7 +342,6 @@ jobs:
 
           export function usePlayground() {
             const [isReady] = useState(true);
-
             const onGameEventRef = useRef<((event: any) => void) | null>(null);
             const onPresenceEventRef = useRef<((presence: any) => void) | null>(null);
             const onLobbyStatusRef = useRef<((status: any) => void) | null>(null);
@@ -360,7 +422,7 @@ jobs:
           cd "$PROJECT_DIR"
           npx cap sync android
 
-      - name: Build APK
+      - name: Build debug APK
         shell: bash
         run: |
           set -euo pipefail
