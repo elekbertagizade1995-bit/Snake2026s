@@ -426,7 +426,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          ICON_FILE="${GITHUB_WORKSPACE}/snake26s-icon.png"
+          ICON_FILE="${GITHUB_WORKSPACE}/.github/workflows/snake26s-icon.png"
           RES_DIR="${PROJECT_DIR}/android/app/src/main/res"
 
           if [[ ! -f "$ICON_FILE" ]]; then
