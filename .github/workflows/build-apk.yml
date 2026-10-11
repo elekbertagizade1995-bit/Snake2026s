@@ -2,58 +2,375 @@ name: Build Snake 26S APK
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Extract project ZIP
-        run: |
-          unzip -o Snake26S-Android-GitHub.zip -d snake-project
-
-      - name: Find project directory
-        run: |
-          echo "Project contents:"
-          find snake-project -maxdepth 3 -type f | head -100
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: snake-project/package-lock.json
-
-      - name: Install dependencies
-        working-directory: snake-project
-        run: npm install
-
-      - name: Build web app
-        working-directory: snake-project
-        run: npm run build
+          node-version: '22'
 
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: 17
+          java-version: '17'
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          mkdir -p "$SDK_ROOT"
+
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+
+          if [[ ! -x "$SDKMANAGER" ]]; then
+            SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager -print -quit 2>/dev/null || true)"
+          fi
+
+          if [[ -z "$SDKMANAGER" || ! -x "$SDKMANAGER" ]]; then
+            echo "Downloading official Android command-line tools..."
+
+            TOOLS_ZIP="$RUNNER_TEMP/commandlinetools-linux.zip"
+            TOOLS_DIR="$RUNNER_TEMP/android-commandlinetools"
+
+            curl --fail --location --retry 3 --retry-delay 2 \
+              "https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip" \
+              --output "$TOOLS_ZIP"
+
+            rm -rf "$TOOLS_DIR"
+            mkdir -p "$TOOLS_DIR" "$SDK_ROOT/cmdline-tools"
+
+            unzip -q "$TOOLS_ZIP" -d "$TOOLS_DIR"
+
+            rm -rf "$SDK_ROOT/cmdline-tools/latest"
+            mv "$TOOLS_DIR/cmdline-tools" "$SDK_ROOT/cmdline-tools/latest"
+
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          fi
+
+          if [[ ! -x "$SDKMANAGER" ]]; then
+            echo "ERROR: sdkmanager could not be located."
+            exit 1
+          fi
+
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null 2>&1 || true
+
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0"
+
+      - name: Rebuild source ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if compgen -G 'snake26s.part-*' > /dev/null; then
+            echo "Reassembling source ZIP..."
+            cat snake26s.part-* > snake26s.zip
+          elif [[ -f snake26s.zip ]]; then
+            echo "Using existing source ZIP."
+          else
+            echo "ERROR: Source ZIP files were not found."
+            exit 1
+          fi
+
+          unzip -tq snake26s.zip
+          mkdir -p snake-project
+          unzip -oq snake26s.zip -d snake-project
+
+      - name: Find project directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_FILE="$(find snake-project -type f -name App.tsx -print -quit)"
+
+          if [[ -z "$APP_FILE" ]]; then
+            echo "ERROR: App.tsx was not found."
+            find snake-project -maxdepth 4 -type f -print | head -80 || true
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$APP_FILE")"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Found project: $PROJECT_DIR"
+
+      - name: Prepare web and Android configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          mkdir -p public
+
+          if [[ -d assets ]]; then
+            mkdir -p public/assets
+            cp -a assets/. public/assets/
+          fi
+
+          cat > package.json <<'PACKAGE_JSON'
+          {
+            "name": "snake-26s",
+            "version": "1.0.0",
+            "private": true,
+            "type": "module",
+            "scripts": {
+              "dev": "vite",
+              "build": "vite build",
+              "preview": "vite preview"
+            },
+            "dependencies": {
+              "@capacitor/android": "^6.2.1",
+              "@capacitor/core": "^6.2.1",
+              "lucide-react": "^0.468.0",
+              "react": "^18.3.1",
+              "react-dom": "^18.3.1"
+            },
+            "devDependencies": {
+              "@capacitor/cli": "^6.2.1",
+              "@vitejs/plugin-react": "^4.3.4",
+              "autoprefixer": "^10.4.20",
+              "postcss": "^8.4.49",
+              "tailwindcss": "^3.4.17",
+              "typescript": "^5.7.2",
+              "vite": "^6.0.5"
+            }
+          }
+          PACKAGE_JSON
+
+          cat > vite.config.ts <<'VITE_CONFIG'
+          import { defineConfig } from 'vite';
+          import react from '@vitejs/plugin-react';
+
+          export default defineConfig({
+            plugins: [react()],
+            base: './'
+          });
+          VITE_CONFIG
+
+          cat > tsconfig.json <<'TSCONFIG'
+          {
+            "compilerOptions": {
+              "target": "ES2020",
+              "useDefineForClassFields": true,
+              "lib": ["ES2020", "DOM", "DOM.Iterable"],
+              "allowJs": false,
+              "skipLibCheck": true,
+              "esModuleInterop": true,
+              "allowSyntheticDefaultImports": true,
+              "strict": false,
+              "forceConsistentCasingInFileNames": true,
+              "module": "ESNext",
+              "moduleResolution": "Bundler",
+              "resolveJsonModule": true,
+              "isolatedModules": true,
+              "noEmit": true,
+              "jsx": "react-jsx"
+            },
+            "include": ["**/*.ts", "**/*.tsx"]
+          }
+          TSCONFIG
+
+          cat > postcss.config.js <<'POSTCSS_CONFIG'
+          export default {
+            plugins: {
+              tailwindcss: {},
+              autoprefixer: {}
+            }
+          };
+          POSTCSS_CONFIG
+
+          cat > tailwind.config.js <<'TAILWIND_CONFIG'
+          export default {
+            content: [
+              './index.html',
+              './App.tsx',
+              './constants.ts',
+              './utils/**/*.{ts,tsx}'
+            ],
+            theme: { extend: {} },
+            plugins: []
+          };
+          TAILWIND_CONFIG
+
+          cat > styles.css <<'STYLES_CSS'
+          @tailwind base;
+          @tailwind components;
+          @tailwind utilities;
+
+          html, body, #root {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+          }
+
+          body {
+            background: #020617;
+            overflow: hidden;
+          }
+
+          * {
+            -webkit-tap-highlight-color: transparent;
+          }
+          STYLES_CSS
+
+          cat > index.html <<'INDEX_HTML'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no" />
+            <meta name="theme-color" content="#020617" />
+            <title>Snake 26S</title>
+          </head>
+          <body>
+            <div id="root"></div>
+            <script type="module" src="./index.tsx"></script>
+          </body>
+          </html>
+          INDEX_HTML
+
+          cat > capacitor.config.ts <<'CAPACITOR_CONFIG'
+          import type { CapacitorConfig } from '@capacitor/cli';
+
+          const config: CapacitorConfig = {
+            appId: 'com.apkdorid.snake26s',
+            appName: 'Snake 26S',
+            webDir: 'dist',
+            bundledWebRuntime: false,
+            android: {
+              allowMixedContent: true
+            }
+          };
+
+          export default config;
+          CAPACITOR_CONFIG
+
+      - name: Replace Playground SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          mkdir -p utils
+
+          cat > utils/usePlayground.ts <<'PLAYGROUND_ADAPTER'
+          import { useCallback, useMemo, useRef, useState } from 'react';
+
+          export function usePlayground() {
+            const [isReady] = useState(true);
+
+            const onGameEventRef = useRef<((event: any) => void) | null>(null);
+            const onPresenceEventRef = useRef<((presence: any) => void) | null>(null);
+            const onLobbyStatusRef = useRef<((status: any) => void) | null>(null);
+
+            const sdk = useMemo(() => ({
+              startGame() {},
+              scoreUpdated(_data: any) {},
+              gameOver() {},
+              levelComplete(_level: any) {},
+              pauseStateChanged(_paused: boolean) {},
+              init: async () => {}
+            }), []);
+
+            return {
+              sdk,
+              isReady,
+              onGameEventRef,
+              onPresenceEventRef,
+              onLobbyStatusRef
+            };
+          }
+
+          export interface BaseGameState {
+            status: string;
+            score: number;
+            level?: number | string;
+          }
+
+          export function usePlaygroundGameLifecycle(
+            _gameState: BaseGameState,
+            _sdk?: any
+          ) {
+            return undefined;
+          }
+
+          export function useRpc<RequestType, ResponseType>(
+            _rpcName: string
+          ): [(payload: RequestType) => Promise<ResponseType>, boolean] {
+            const [isLoading, setIsLoading] = useState(false);
+
+            const callRpc = useCallback(async (_payload: RequestType) => {
+              setIsLoading(false);
+              return undefined as ResponseType;
+            }, []);
+
+            return [callRpc, isLoading];
+          }
+          PLAYGROUND_ADAPTER
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          npm install --no-audit --no-fund
+
+      - name: Build web game
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          npm run build
+
+      - name: Add Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          if [[ ! -d android ]]; then
+            npx cap add android
+          fi
 
       - name: Sync Capacitor
-        working-directory: snake-project
-        run: npx cap sync android
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          npx cap sync android
 
       - name: Build APK
-        working-directory: snake-project/android
-        run: ./gradlew assembleDebug
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR/android"
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Snake-26S-debug-apk
-          path: snake-project/android/app/build/outputs/apk/debug/app-debug.apk
+          name: Snake26S-APK
+          path: ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
